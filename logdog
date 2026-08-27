@@ -1,0 +1,326 @@
+#!/usr/bin/env python3
+"""logdog — a better `adb logcat`.
+
+Colored, filterable logcat viewer inspired by Android Studio's Logcat panel.
+
+Examples:
+  logdog com.myapp.debug              # only logs from this package
+  logdog --current                    # logs from current foreground app
+  logdog -t MyTag -t "Retrofit.*"     # filter by tag (regex, repeatable)
+  logdog -l W                         # warnings and above
+  logdog com.myapp -g "token"         # grep message text (highlighted)
+  logdog -i chatty -i ViewRootImpl    # ignore noisy tags
+  logdog -s emulator-5554 com.myapp   # specific device
+"""
+
+import argparse
+import re
+import shutil
+import signal
+import subprocess
+import sys
+
+# ---------------------------------------------------------------- colors ---
+
+CSI = "\033["
+RESET = f"{CSI}0m"
+
+
+def fg256(n):
+    return f"{CSI}38;5;{n}m"
+
+
+def bg256(n):
+    return f"{CSI}48;5;{n}m"
+
+
+BOLD = f"{CSI}1m"
+DIM = f"{CSI}2m"
+
+# Android Studio-like level styling: badge + message color
+LEVEL_STYLES = {
+    "V": (fg256(250), bg256(238) + fg256(255)),
+    "D": (fg256(75), bg256(25) + fg256(255)),
+    "I": (fg256(40), bg256(28) + fg256(255)),
+    "W": (fg256(214), bg256(130) + fg256(232)),
+    "E": (fg256(196), bg256(124) + fg256(255)),
+    "F": (fg256(201), bg256(89) + fg256(255)),
+}
+
+LEVEL_ORDER = "VDIWEF"
+
+# Stable palette for tag coloring (distinct, readable on dark terminals)
+TAG_PALETTE = [39, 45, 51, 78, 84, 118, 154, 172, 178, 208, 209, 213, 105, 141, 147, 81]
+
+
+def tag_color(tag, cache={}):
+    if tag not in cache:
+        cache[tag] = TAG_PALETTE[hash(tag) % len(TAG_PALETTE)]
+    return fg256(cache[tag])
+
+
+# ----------------------------------------------------------------- adb -----
+
+
+def adb_base(args):
+    cmd = ["adb"]
+    if args.serial:
+        cmd += ["-s", args.serial]
+    elif args.usb:
+        cmd += ["-d"]
+    elif args.emulator:
+        cmd += ["-e"]
+    return cmd
+
+
+def adb_shell(args, shell_cmd):
+    try:
+        out = subprocess.run(
+            adb_base(args) + ["shell", shell_cmd],
+            capture_output=True, text=True, timeout=10,
+        )
+        return out.stdout.strip()
+    except subprocess.TimeoutExpired:
+        return ""
+
+
+def resolve_current_package(args):
+    """Foreground app package via dumpsys."""
+    for cmd, pattern in (
+        ("dumpsys activity activities", r"topResumedActivity.*?\s([\w.]+)/"),
+        ("dumpsys window", r"mCurrentFocus.*?\s([\w.]+)/"),
+    ):
+        out = adb_shell(args, cmd)
+        m = re.search(pattern, out)
+        if m:
+            return m.group(1)
+    die("could not detect foreground app")
+
+
+def initial_pids(args, packages):
+    """Existing PIDs for target packages before we start streaming."""
+    pids = {}
+    out = adb_shell(args, "ps -A -o PID,NAME 2>/dev/null || ps")
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 2 or not parts[0].isdigit():
+            continue
+        pid, name = parts[0], parts[-1]
+        proc_pkg = name.split(":")[0]  # com.app:remote -> com.app
+        if proc_pkg in packages:
+            pids[pid] = name
+    return pids
+
+
+def die(msg):
+    print(f"logdog: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+# --------------------------------------------------------------- parsing ---
+
+# threadtime: "08-27 14:31:56.123  1234  5678 D MyTag  : message"
+THREADTIME_RE = re.compile(
+    r"^(?P<date>\d{2}-\d{2})\s+(?P<time>\d{2}:\d{2}:\d{2}\.\d{3})\s+"
+    r"(?P<pid>\d+)\s+(?P<tid>\d+)\s+(?P<level>[VDIWEF])\s+"
+    r"(?P<tag>.*?)\s*:\s(?P<msg>.*)$"
+)
+
+# ActivityManager process lifecycle (for live PID tracking)
+START_PROC_RE = re.compile(r"Start proc (?P<pid>\d+):(?P<name>[^/\s]+)")
+DIED_PROC_RE = re.compile(r"Process (?P<name>[\S]+) \(pid (?P<pid>\d+)\) has died")
+KILL_PROC_RE = re.compile(r"Killing (?P<pid>\d+):(?P<name>[^/\s]+)")
+
+
+# -------------------------------------------------------------- renderer ---
+
+
+class Renderer:
+    def __init__(self, args):
+        self.args = args
+        self.width = shutil.get_terminal_size((120, 24)).columns
+        self.tag_width = args.tag_width
+        self.last_tag = None
+        self.grep_re = re.compile(args.grep, re.IGNORECASE) if args.grep else None
+
+    def header_width(self):
+        w = self.tag_width + 4  # tag + " X  " badge
+        if self.args.time:
+            w += 13  # "14:31:56.123 "
+        if self.args.show_pid:
+            w += 12
+        return w
+
+    def render(self, entry):
+        level, tag, msg = entry["level"], entry["tag"], entry["msg"]
+        msg_color, badge = LEVEL_STYLES[level]
+        parts = []
+
+        if self.args.time:
+            parts.append(f"{DIM}{entry['time']}{RESET} ")
+
+        if self.args.show_pid:
+            parts.append(f"{DIM}{entry['pid']:>5}-{entry['tid']:<5}{RESET} ")
+
+        # Dedup consecutive identical tags (like Android Studio)
+        shown = "" if (tag == self.last_tag and not self.args.always_tags) else tag
+        self.last_tag = tag
+        if len(shown) > self.tag_width:
+            shown = shown[: self.tag_width - 1] + "…"
+        parts.append(f"{tag_color(tag)}{shown:>{self.tag_width}}{RESET} ")
+        parts.append(f"{badge} {level} {RESET} ")
+
+        if self.grep_re:
+            msg = self.grep_re.sub(lambda m: f"{bg256(226)}{fg256(16)}{m.group(0)}{RESET}{msg_color}", msg)
+
+        # Wrap message under the header so continuation lines align
+        indent = self.header_width()
+        avail = max(self.width - indent, 20)
+        out_lines = []
+        first = True
+        text = msg or " "
+        while text:
+            chunk, text = text[:avail], text[avail:]
+            prefix = "".join(parts) if first else " " * indent
+            out_lines.append(f"{prefix}{msg_color}{chunk}{RESET}")
+            first = False
+        return "\n".join(out_lines)
+
+    def render_event(self, text):
+        pad = " " * max((self.width - len(text) - 2) // 2, 0)
+        return f"{pad}{BOLD}{fg256(226)}✦ {text}{RESET}"
+
+
+# ----------------------------------------------------------------- main ----
+
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="logdog",
+        description="Better adb logcat: colors + filtering like Android Studio.",
+        epilog=__doc__.split("Examples:")[1],
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("package", nargs="*", help="package name(s) to filter by (prefix match allowed with trailing '*')")
+    p.add_argument("-c", "--current", action="store_true", help="filter by current foreground app")
+    p.add_argument("-t", "--tag", action="append", default=[], metavar="TAG", help="show only these tags (regex, repeatable)")
+    p.add_argument("-i", "--ignore-tag", action="append", default=[], metavar="TAG", help="hide these tags (regex, repeatable)")
+    p.add_argument("-l", "--level", default="V", choices=list(LEVEL_ORDER), type=str.upper, help="minimum log level (default V)")
+    p.add_argument("-g", "--grep", metavar="REGEX", help="show only messages matching regex (highlighted)")
+    p.add_argument("--time", action="store_true", help="show timestamps")
+    p.add_argument("--show-pid", action="store_true", help="show PID-TID column")
+    p.add_argument("--tag-width", type=int, default=23, help="tag column width (default 23)")
+    p.add_argument("--always-tags", action="store_true", help="never dedup repeated tag names")
+    p.add_argument("--clear", action="store_true", help="clear logcat buffer before streaming")
+    p.add_argument("--dump", action="store_true", help="dump buffer and exit (no follow)")
+    p.add_argument("-s", "--serial", metavar="SERIAL", help="device serial (adb -s)")
+    p.add_argument("-d", "--usb", action="store_true", help="use USB device (adb -d)")
+    p.add_argument("-e", "--emulator", action="store_true", help="use emulator (adb -e)")
+    p.add_argument("-b", "--buffer", action="append", default=[], metavar="BUF", help="logcat buffer: main, system, crash, events... (repeatable)")
+    return p
+
+
+class Filter:
+    def __init__(self, args, packages, pids):
+        self.args = args
+        self.packages = packages          # set of package names / prefixes
+        self.pids = pids                  # pid(str) -> process name
+        self.min_level = LEVEL_ORDER.index(args.level)
+        self.tag_res = [re.compile(t, re.IGNORECASE) for t in args.tag]
+        self.ignore_res = [re.compile(t, re.IGNORECASE) for t in args.ignore_tag]
+        self.grep_re = re.compile(args.grep, re.IGNORECASE) if args.grep else None
+
+    def match_package(self, name):
+        proc_pkg = name.split(":")[0]
+        for p in self.packages:
+            if p.endswith("*"):
+                if proc_pkg.startswith(p[:-1]):
+                    return True
+            elif proc_pkg == p:
+                return True
+        return False
+
+    def track_lifecycle(self, entry):
+        """Watch ActivityManager for process start/death of target packages.
+        Returns event string to display, or None."""
+        if not self.packages or entry["tag"] != "ActivityManager":
+            return None
+        msg = entry["msg"]
+        m = START_PROC_RE.search(msg)
+        if m and self.match_package(m.group("name")):
+            self.pids[m.group("pid")] = m.group("name")
+            return f"process started: {m.group('name')} (pid {m.group('pid')})"
+        m = DIED_PROC_RE.search(msg) or KILL_PROC_RE.search(msg)
+        if m and m.group("pid") in self.pids:
+            name = self.pids.pop(m.group("pid"))
+            return f"process died: {name} (pid {m.group('pid')})"
+        return None
+
+    def accept(self, entry):
+        if self.packages and entry["pid"] not in self.pids:
+            return False
+        if LEVEL_ORDER.index(entry["level"]) < self.min_level:
+            return False
+        tag = entry["tag"]
+        if self.tag_res and not any(r.search(tag) for r in self.tag_res):
+            return False
+        if any(r.search(tag) for r in self.ignore_res):
+            return False
+        if self.grep_re and not self.grep_re.search(entry["msg"]):
+            return False
+        return True
+
+
+def main():
+    args = build_parser().parse_args()
+
+    if not shutil.which("adb"):
+        die("adb not found in PATH")
+
+    packages = set(args.package)
+    if args.current:
+        packages.add(resolve_current_package(args))
+
+    pids = initial_pids(args, {p.rstrip("*") for p in packages}) if packages else {}
+    if packages:
+        names = ", ".join(sorted(packages))
+        live = ", ".join(f"{n}({p})" for p, n in pids.items()) or "not running"
+        print(f"{DIM}logdog: watching {names} — {live}{RESET}", file=sys.stderr)
+
+    if args.clear:
+        subprocess.run(adb_base(args) + ["logcat", "-c"], check=False)
+
+    logcat_cmd = adb_base(args) + ["logcat", "-v", "threadtime"]
+    for b in args.buffer:
+        logcat_cmd += ["-b", b]
+    if args.dump:
+        logcat_cmd += ["-d"]
+
+    filt = Filter(args, packages, pids)
+    renderer = Renderer(args)
+
+    signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
+
+    proc = subprocess.Popen(
+        logcat_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, errors="replace", bufsize=1,
+    )
+    try:
+        for line in proc.stdout:
+            m = THREADTIME_RE.match(line.rstrip("\n"))
+            if not m:
+                continue
+            entry = m.groupdict()
+            event = filt.track_lifecycle(entry)
+            if event:
+                print(renderer.render_event(event))
+            if filt.accept(entry):
+                print(renderer.render(entry))
+    except BrokenPipeError:
+        pass
+    finally:
+        proc.terminate()
+
+
+if __name__ == "__main__":
+    main()
