@@ -4,6 +4,8 @@ A better `adb logcat` for the terminal: colors and filtering like Android Studio
 
 Single-file Python 3 script, zero dependencies. Requires `adb` in PATH.
 
+<img width="968" height="366" alt="Screenshot 2026-08-28 at 13 38 44" src="https://github.com/user-attachments/assets/849b6896-ba8b-43ee-8e83-55a6309d923f" />
+
 ## Install
 
 ```bash
